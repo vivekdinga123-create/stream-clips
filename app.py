@@ -1,6 +1,6 @@
 import os, re, json, uuid, subprocess, threading
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request as HTTPRequest
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
@@ -9,6 +9,7 @@ import yt_dlp
 DATA=Path("/data"); DATA.mkdir(exist_ok=True)
 JOBS={}
 LOCK=threading.Lock()
+COOKIE_FILE=DATA/"youtube_cookies.txt"
 app=FastAPI(title="Stream Clips")
 app.mount("/static",StaticFiles(directory="static"),name="static")
 
@@ -16,6 +17,39 @@ class Request(BaseModel):
     url: HttpUrl
     topic: str="Gaming"
     clips: int=3
+
+def ydl_auth_options():
+    return {"cookiefile": str(COOKIE_FILE)} if COOKIE_FILE.is_file() else {}
+
+@app.post("/api/settings/youtube-cookies")
+async def save_youtube_cookies(request: HTTPRequest):
+    expected=os.getenv("COOKIE_SETUP_PASSWORD","")
+    supplied=request.headers.get("x-admin-password","")
+    if not expected or not supplied or not __import__("hmac").compare_digest(expected,supplied):
+        raise HTTPException(401,"Invalid setup password")
+    raw=await request.body()
+    if not raw or len(raw)>2_000_000:
+        raise HTTPException(400,"Cookie file is empty or too large (2 MB maximum)")
+    try: content=raw.decode("utf-8-sig")
+    except UnicodeDecodeError: raise HTTPException(400,"Upload a UTF-8 Netscape cookies.txt file")
+    valid=[]
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"): continue
+        fields=line.split("\\t")
+        if len(fields)>=7 and ("youtube.com" in fields[0].lower() or "google.com" in fields[0].lower()):
+            valid.append(line)
+    if not valid:
+        raise HTTPException(400,"No YouTube/Google cookies found. Export cookies in Netscape cookies.txt format.")
+    temp=DATA/"youtube_cookies.tmp"
+    temp.write_text(content,encoding="utf-8")
+    os.chmod(temp,0o600)
+    temp.replace(COOKIE_FILE)
+    os.chmod(COOKIE_FILE,0o600)
+    return {"ok":True,"message":"YouTube cookies saved securely on the server."}
+
+@app.get("/api/settings/youtube-cookies")
+def youtube_cookie_status():
+    return {"configured":COOKIE_FILE.is_file()}
 
 def command(args):
     p=subprocess.run(args,capture_output=True,text=True)
@@ -34,7 +68,7 @@ def worker(j,req):
     try:
         url=str(req.url)
         update(j,status="downloading",progress=4,message="Reading video details and downloading audio")
-        ydl={"format":"bestaudio/best","outtmpl":str(folder/"audio.%(ext)s"),"quiet":True,"no_warnings":True}
+        ydl={"format":"bestaudio/best","outtmpl":str(folder/"audio.%(ext)s"),"quiet":True,"no_warnings":True,**ydl_auth_options()}
         with yt_dlp.YoutubeDL(ydl) as y: info=y.extract_info(url,download=True)
         audio=next(folder.glob("audio.*"))
         update(j,status="transcribing",progress=22,message="Transcribing stream audio")
@@ -67,7 +101,7 @@ def worker(j,req):
         for n,(_,start,end,words) in enumerate(sorted(chosen,key=lambda x:x[1]),1):
             update(j,status="rendering",progress=50+int(45*n/len(chosen)),message=f"Rendering vertical clip {n} of {len(chosen)}")
             pattern=str(folder/f"segment{n}.%(ext)s")
-            opts={"format":"bestvideo[height<=1080]+bestaudio/best[height<=1080]","outtmpl":pattern,"download_sections":[f"*{start:.2f}-{end:.2f}"],"force_keyframes_at_cuts":True,"merge_output_format":"mp4","quiet":True,"no_warnings":True}
+            opts={"format":"bestvideo[height<=1080]+bestaudio/best[height<=1080]","outtmpl":pattern,"download_sections":[f"*{start:.2f}-{end:.2f}"],"force_keyframes_at_cuts":True,"merge_output_format":"mp4","quiet":True,"no_warnings":True,**ydl_auth_options()}
             with yt_dlp.YoutubeDL(opts) as y: y.download([url])
             sources=list(folder.glob(f"segment{n}.*"))
             if not sources: raise RuntimeError(f"Could not locate downloaded segment {n}")
